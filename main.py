@@ -1,14 +1,51 @@
+import json
+import os
 import random
+import threading
+import time
 import requests
 from bs4 import BeautifulSoup
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 
-# Токен вашей группы ВКонтакте (вставьте сюда ваш актуальный токен)
+# ================= КОНФИГУРАЦИЯ =================
+# Токен вашей группы ВКонтакте
 VK_TOKEN = "4f4b3087ffe983731d3c9bbefde89cf90bcff80a55595299c438bf2cfc88c77b6cbb7b1a1031349182e86"
+
+# Ваш цифровой ID ВКонтакте (куда будут приходить автоматические уведомления)
+# Его можно узнать, например, отправив любое сообщение запущенному боту — он выведет его в консоль.
+ADMIN_VK_ID = 588085501  # Замените на ваш числовой ID
+
+# Интервал проверки в секундах (1800 секунд = 30 минут)
+CHECK_INTERVAL = 1800
 
 # URL страницы абитуриента 2227887
 TARGET_URL = "https://abiturient.unn.ru/list/abit.php?id=281474976968093"
+# ================================================
+
+STATE_FILE = "last_state.json"
+state_lock = threading.Lock()
+
+
+def load_state():
+    """Загружает сохраненное ранее состояние из файла."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Ошибка при загрузке состояния: {e}")
+            return {}
+    return {}
+
+
+def save_state(state):
+    """Сохраняет текущее состояние в файл."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Ошибка при сохранении состояния: {e}")
 
 
 def parse_applicant_data(url):
@@ -22,7 +59,7 @@ def parse_applicant_data(url):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
             return f"Ошибка при запросе к сайту: статус {response.status_code}"
     except Exception as e:
@@ -44,7 +81,6 @@ def parse_applicant_data(url):
     for row in rows:
         cols = row.find_all("td")
         if len(cols) >= 11:
-            # Проверяем, выделено ли направление желтым цветом (текущий проход по конкурсу)
             style_attr = row.get("style", "")
             is_recommended = "#e2e51e" in style_attr
 
@@ -80,21 +116,65 @@ def parse_applicant_data(url):
     return results
 
 
-def format_message(data):
-    """Форматирует спарсенные данные в удобное текстовое сообщение для ВК."""
+def check_for_updates(current_data, last_state):
+    """Сравнивает текущие данные со старыми и находит изменения."""
+    changes = []
+    new_state = {}
+
+    for item in current_data:
+        dir_name = item["direction"]
+        pos = item["position"]
+        consent = item["if_consent"]
+
+        new_state[dir_name] = {"position": pos, "if_consent": consent}
+
+        # Если это направление уже проверялось ранее
+        if dir_name in last_state:
+            old_pos = last_state[dir_name].get("position")
+            old_consent = last_state[dir_name].get("if_consent")
+
+            pos_changed = old_pos != pos
+            consent_changed = old_consent != consent
+
+            if pos_changed or consent_changed:
+                changes.append(
+                    {
+                        "direction": dir_name,
+                        "old_pos": old_pos,
+                        "new_pos": pos,
+                        "old_consent": old_consent,
+                        "new_consent": consent,
+                    }
+                )
+
+    return changes, new_state
+
+
+def format_changes_message(changes):
+    """Форматирует сообщение об изменениях в положении."""
+    msg = "⚠️ *Внимание! Изменилось ваше положение в списках!*\n\n"
+    for c in changes:
+        msg += f"📘 *{c['direction']}*\n"
+        if c["old_pos"] != c["new_pos"]:
+            msg += f"  • Положение в списке: {c['old_pos']} ➡️ {c['new_pos']}\n"
+        if c["old_consent"] != c["new_consent"]:
+            msg += f"  • Если подам согласие: {c['old_consent']} ➡️ {c['new_consent']}\n"
+        msg += "\n"
+    return msg
+
+
+def format_status_message(data):
+    """Форматирует полную сводку по запросу."""
     if isinstance(data, str):
-        return data  # Возвращаем текст ошибки, если парсинг не удался
+        return data
 
-    msg = "📊 *Статистика заявлений абитуриента 2227887:*\n\n"
-
+    msg = "📊 *Текущая статистика поданных заявлений:*\n\n"
     for item in data:
-        # Если направление выделено цветом, добавляем пометку
         recom_tag = (
             "⭐ *[ПРОХОДИТ ПРИ ПОДАЧЕ СОГЛАСИЯ]*"
             if item["is_recommended"]
             else ""
         )
-
         msg += (
             f"🔹 *№ {item['num']}: {item['direction']}* {recom_tag}\n"
             f" 🏛 Факультет: {item['faculty']}\n"
@@ -104,52 +184,4 @@ def format_message(data):
             f" 👥 Мест в плане набора: {item['places']}\n"
             f" ⚡ Статус: {item['status']}\n"
             f" 🟢 Положение, если подаст согласие: {item['if_consent']}\n"
-            f" 📈 Текущее положение в списке: {item['position']}\n\n"
-        )
-    return msg
-
-
-def main():
-    # Авторизация в VK API
-    try:
-        vk_session = vk_api.VkApi(token=VK_TOKEN)
-        vk = vk_session.get_api()
-        longpoll = VkLongPoll(vk_session)
-        print("Бот успешно запущен и слушает сообщения...")
-    except Exception as e:
-        print(f"Ошибка авторизации ВКонтакте: {e}")
-        return
-
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_msg = event.text.lower().strip()
-
-            if user_msg in ["старт", "привет", "статус", "2227887", "обновить"]:
-                # Отправляем предварительное сообщение (random_id на 31 бит)
-                vk.messages.send(
-                    user_id=event.user_id,
-                    message="Запрашиваю актуальные данные с сайта ННГУ...",
-                    random_id=random.getrandbits(31)
-                )
-
-                # Парсинг данных
-                parsed_data = parse_applicant_data(TARGET_URL)
-                response_message = format_message(parsed_data)
-
-                # Отправка результата (random_id на 31 бит)
-                vk.messages.send(
-                    user_id=event.user_id,
-                    message=response_message,
-                    random_id=random.getrandbits(31)
-                )
-            else:
-                # Ответ-подсказка (random_id на 31 бит)
-                vk.messages.send(
-                    user_id=event.user_id,
-                    message="Отправьте слово 'статус' или 'обновить', чтобы получить данные по абитуриенту 2227887.",
-                    random_id=random.getrandbits(31)
-                )
-
-
-if __name__ == "__main__":
-    main()
+            f" 📈 Текущее
