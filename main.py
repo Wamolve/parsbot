@@ -184,4 +184,104 @@ def format_status_message(data):
             f" 👥 Мест в плане набора: {item['places']}\n"
             f" ⚡ Статус: {item['status']}\n"
             f" 🟢 Положение, если подаст согласие: {item['if_consent']}\n"
-            f" 📈 Текущее
+            f" 📈 Текущее положение в списке: {item['position']}\n\n"
+        )
+    return msg
+
+
+def background_checker(vk):
+    """Фоновая функция, запускаемая в отдельном потоке каждые 30 минут."""
+    print("Фоновый поток мониторинга успешно запущен.")
+    while True:
+        try:
+            parsed_data = parse_applicant_data(TARGET_URL)
+
+            if not isinstance(parsed_data, str):
+                with state_lock:
+                    last_state = load_state()
+                    changes, new_state = check_for_updates(
+                        parsed_data, last_state
+                    )
+
+                    # Отправляем уведомление только если у нас уже было сохранено предыдущее состояние
+                    if last_state:
+                        if changes:
+                            notification = format_changes_message(changes)
+                            vk.messages.send(
+                                user_id=ADMIN_VK_ID,
+                                message=notification,
+                                random_id=random.getrandbits(31),
+                            )
+                            print("Уведомление об изменениях отправлено.")
+                    else:
+                        print(
+                            "Первый запуск: базовое состояние сохранено. Слежение началось."
+                        )
+
+                    # В любом случае сохраняем новые данные
+                    save_state(new_state)
+            else:
+                print(f"Ошибка при фоновом парсинге: {parsed_data}")
+
+        except Exception as e:
+            print(f"Исключение в фоновом потоке: {e}")
+
+        time.sleep(CHECK_INTERVAL)
+
+
+def main():
+    try:
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkLongPoll(vk_session)
+        print("Бот успешно запущен и слушает сообщения...")
+    except Exception as e:
+        print(f"Ошибка авторизации ВКонтакте: {e}")
+        return
+
+    # Запускаем фоновую проверку каждые 30 минут в отдельном потоке
+    checker_thread = threading.Thread(
+        target=background_checker, args=(vk,), daemon=True
+    )
+    checker_thread.start()
+
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            user_msg = event.text.lower().strip()
+
+            # Вывод ID пользователя в консоль при любом сообщении (для удобства настройки)
+            print(
+                f"Получено сообщение от ID {event.user_id}: {event.text} (Настройки ADMIN_VK_ID: {ADMIN_VK_ID})"
+            )
+
+            if user_msg in ["старт", "привет", "статус", "2227887", "обновить"]:
+                vk.messages.send(
+                    user_id=event.user_id,
+                    message="Запрашиваю актуальные данные с сайта ННГУ...",
+                    random_id=random.getrandbits(31),
+                )
+
+                parsed_data = parse_applicant_data(TARGET_URL)
+                response_message = format_status_message(parsed_data)
+
+                vk.messages.send(
+                    user_id=event.user_id,
+                    message=response_message,
+                    random_id=random.getrandbits(31),
+                )
+
+                # Синхронизируем сохраненное состояние, чтобы не отправлять дубликаты позже
+                if not isinstance(parsed_data, str):
+                    with state_lock:
+                        _, new_state = check_for_updates(parsed_data, {})
+                        save_state(new_state)
+            else:
+                vk.messages.send(
+                    user_id=event.user_id,
+                    message="Отправьте слово 'статус' или 'обновить', чтобы получить данные по абитуриенту 2227887.",
+                    random_id=random.getrandbits(31),
+                )
+
+
+if __name__ == "__main__":
+    main()
