@@ -1,4 +1,4 @@
 vk_api
 beautifulsoup4
 requests
-
+selenium
